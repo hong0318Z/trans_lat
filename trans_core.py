@@ -112,6 +112,19 @@ def extract_strings(lines: list) -> list:
     return results
 
 
+def extract_lines_for_translation(lines: list) -> list:
+    """
+    Plain txt 모드: 비어있지 않은 각 줄 전체를 번역 단위로 추출.
+    반환 형식은 extract_strings와 동일: (line_idx, 0, len, content, content)
+    """
+    results = []
+    for line_idx, line in enumerate(lines):
+        content = line.rstrip('\r\n')
+        if content.strip():
+            results.append((line_idx, 0, len(content), content, content))
+    return results
+
+
 # ── 문자열 병합 ────────────────────────────────────────────────────────────
 
 def _escape_for_qsp(text: str) -> str:
@@ -160,6 +173,26 @@ def merge_debug(lines: list, translations: dict, extractions: list) -> list:
             combined = f"{trans} ({orig_text})" if orig_text else trans
             by_line.setdefault(li, []).append((start, end, combined))
     return _apply_replacements(lines, by_line)
+
+
+def merge_final_plain(lines: list, translations: dict, extractions: list) -> list:
+    """Plain txt: 각 줄 전체를 번역문으로 교체."""
+    result = list(lines)
+    for (li, start, end, raw, unesc) in extractions:
+        key = (li, start)
+        if key in translations and translations[key]:
+            result[li] = translations[key]
+    return result
+
+
+def merge_debug_plain(lines: list, translations: dict, extractions: list) -> list:
+    """Plain txt 디버그: '번역문  ←  원문' 형식."""
+    result = list(lines)
+    for (li, start, end, raw, unesc) in extractions:
+        key = (li, start)
+        if key in translations and translations[key]:
+            result[li] = f"{translations[key]}  ←  {unesc}"
+    return result
 
 
 # ── LLM 응답 파싱 ──────────────────────────────────────────────────────────
@@ -590,13 +623,18 @@ class TranslationEngine:
                   lines_per_chunk: int = LINES_PER_CHUNK,
                   max_chunks_per_run: int = 0,
                   glossary: list = None,
-                  state_path: str = None):
+                  state_path: str = None,
+                  plain_mode: bool = None):
         self._input_path        = input_path
         self._output_debug      = output_debug
         self._output_final      = output_final
         self._system_prompt     = system_prompt
         self._max_chunks_per_run = max_chunks_per_run
         self._glossary          = glossary or []
+        if plain_mode is None:
+            self._plain_mode = Path(input_path).suffix.lower() not in ('.txr', '.qsp')
+        else:
+            self._plain_mode = plain_mode
         self._chunker   = FileChunker(input_path, lines_per_chunk)
         self._state_mgr = StateManager(input_path, state_path)
         self._client    = TranslatorClient(token, model)
@@ -706,7 +744,10 @@ class TranslationEngine:
                 line_start = entry["line_start"]
                 line_end   = entry["line_end"]
                 lines      = self._chunker.get_chunk_lines(chunk_idx)
-                extractions = extract_strings(lines)
+                if self._plain_mode:
+                    extractions = extract_lines_for_translation(lines)
+                else:
+                    extractions = extract_strings(lines)
 
                 on_chunk_start(chunk_idx, len(chunk_map),
                                line_start, line_end,
@@ -773,8 +814,12 @@ class TranslationEngine:
                         f"번역 완료, 토큰 입력 {tok_in} / 출력 {tok_out}"
                     )
 
-                    debug_lines = merge_debug(lines, translations, extractions)
-                    final_lines = merge_final(lines, translations, extractions)
+                    if self._plain_mode:
+                        debug_lines = merge_debug_plain(lines, translations, extractions)
+                        final_lines = merge_final_plain(lines, translations, extractions)
+                    else:
+                        debug_lines = merge_debug(lines, translations, extractions)
+                        final_lines = merge_final(lines, translations, extractions)
 
                 # 출력 파일 쓰기
                 debug_byte_end = _write_lines(debug_path, debug_lines, first_write)
@@ -796,17 +841,19 @@ class TranslationEngine:
                 )
                 self._state_mgr.save()
 
+                chunks_this_run += 1
                 on_chunk_done(
                     chunk_idx, len(chunk_map),
-                    state["chunks_done"],
-                    debug_lines, final_lines,
+                    chunks_this_run, self._max_chunks_per_run,
+                    final_lines, debug_lines,
                     tok_in, tok_out,
+                    last_context,
                 )
                 on_log(f"[청크 {chunk_idx+1}/{len(chunk_map)}] 완료. 상태 저장됨.")
-                chunks_this_run += 1
 
             elapsed = time.time() - run_start
-            on_complete(state["chunks_done"], state["total_chunks"], elapsed)
+            all_done = state["chunks_done"] >= state["total_chunks"]
+            on_complete(state["total_chunks"], state["chunks_done"], all_done)
 
         except Exception as e:
             try:
