@@ -10,6 +10,7 @@ import time
 from trans_core import (
     TranslationEngine, StateManager, MODEL_CONFIGS, DEFAULT_MODEL,
     DEFAULT_SYSTEM_PROMPT, LINES_PER_CHUNK, TranslatorClient,
+    AppConfig, ProjectManager,
 )
 
 # ── 다크 테마 ──────────────────────────────────────────────────────────────
@@ -44,8 +45,13 @@ class TranslationApp(tk.Tk):
         self._glossary_rows = []  # list of (frame, src_var, tgt_var)
         self._settings_visible = True
         self._syncing_scroll = False
+        self._config = AppConfig()
+        self._proj_mgr = ProjectManager()
+        self._current_project: dict | None = None
         self._build_style()
         self._build_ui()
+        self._load_config_and_projects()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── 스타일 ──────────────────────────────────────────────────
     def _build_style(self):
@@ -70,13 +76,14 @@ class TranslationApp(tk.Tk):
 
     # ── UI 빌드 ─────────────────────────────────────────────────
     def _build_ui(self):
-        # 최상단 토글 버튼
+        # 최상단 — 토글 버튼 + 프로젝트 바
         top = tk.Frame(self, bg=THEME["bg"])
         top.pack(fill="x", padx=4, pady=2)
         self._toggle_btn = tk.Button(top, text="▼ 설정 접기", bg=THEME["btn"],
                                      fg=THEME["fg"], relief="flat", bd=0,
                                      command=self._toggle_settings)
         self._toggle_btn.pack(side="left")
+        self._build_project_bar(top)
 
         # 설정 패널
         self._settings_frame = ttk.LabelFrame(self, text="설정", padding=6)
@@ -149,15 +156,15 @@ class TranslationApp(tk.Tk):
         self._model_combo.pack(side="left", padx=4)
         self._model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
 
-        ttk.Label(opt_fr, text="  이번 실행 청크 수 (0=끝까지):").pack(side="left")
-        self._chunks_run_var = tk.StringVar(value="10")
+        ttk.Label(opt_fr, text="  줄 수/배치:").pack(side="left")
+        self._lpc_var = tk.StringVar(value=str(LINES_PER_CHUNK))
+        ttk.Spinbox(opt_fr, from_=1, to=10000, textvariable=self._lpc_var,
+                    width=7).pack(side="left", padx=4)
+
+        ttk.Label(opt_fr, text="  연속 배치 수 (0=끝까지):").pack(side="left")
+        self._chunks_run_var = tk.StringVar(value="0")
         ttk.Spinbox(opt_fr, from_=0, to=9999, textvariable=self._chunks_run_var,
                     width=6).pack(side="left", padx=4)
-
-        ttk.Label(opt_fr, text="  청크 줄수:").pack(side="left")
-        self._lpc_var = tk.StringVar(value=str(LINES_PER_CHUNK))
-        ttk.Spinbox(opt_fr, from_=500, to=10000, textvariable=self._lpc_var,
-                    width=7).pack(side="left", padx=4)
 
         # 시스템 프롬프트
         prm_fr = ttk.LabelFrame(parent, text="시스템 프롬프트", padding=4)
@@ -294,6 +301,203 @@ class TranslationApp(tk.Tk):
             base += "\n".join(lines)
         return base
 
+    # ── 프로젝트 바 ─────────────────────────────────────────────
+    def _build_project_bar(self, parent):
+        fr = tk.Frame(parent, bg=THEME["bg"])
+        fr.pack(side="left", padx=(12, 0))
+
+        tk.Label(fr, text="프로젝트:", bg=THEME["bg"],
+                 fg=THEME["fg2"]).pack(side="left", padx=(0, 4))
+
+        self._project_combo = ttk.Combobox(fr, width=28, state="readonly")
+        self._project_combo.pack(side="left", padx=4)
+        self._project_combo.bind("<<ComboboxSelected>>", self._on_project_selected)
+
+        tk.Button(fr, text="+ 새 프로젝트", bg=THEME["btn"], fg=THEME["fg"],
+                  relief="flat", bd=0,
+                  command=self._on_new_project, padx=6).pack(side="left", padx=4)
+        self._btn_del_proj = tk.Button(fr, text="삭제", bg=THEME["err"], fg="#1e1e2e",
+                                       relief="flat", bd=0,
+                                       command=self._on_delete_project, padx=6)
+        self._btn_del_proj.pack(side="left", padx=2)
+
+        self._project_status = tk.Label(fr, text="", bg=THEME["bg"],
+                                        fg=THEME["fg2"])
+        self._project_status.pack(side="left", padx=8)
+
+    def _refresh_project_combo(self):
+        names = self._proj_mgr.get_names()
+        self._project_combo['values'] = names
+        if not names:
+            self._project_combo.set("")
+            self._project_status.configure(text="프로젝트 없음")
+        elif self._current_project and self._current_project["name"] in names:
+            self._project_combo.set(self._current_project["name"])
+
+    def _on_project_selected(self, event=None):
+        name = self._project_combo.get()
+        proj = self._proj_mgr.get_project(name)
+        if not proj:
+            return
+        self._current_project = proj
+        self._input_var.set(proj["input_path"])
+        p = Path(proj["input_path"])
+        if not self._debug_var.get():
+            self._debug_var.set(str(p.parent / (p.stem + "_debug.txr")))
+        if not self._final_var.get():
+            self._final_var.set(str(p.parent / (p.stem + "_kr.txr")))
+
+        state_path = proj.get("state_file_path", "")
+        if state_path and Path(state_path).exists():
+            try:
+                sm = StateManager(proj["input_path"], state_path)
+                state = sm.load()
+                done  = sum(1 for c in state["chunk_map"] if c["status"] == "done")
+                total = state["total_chunks"]
+                pct   = done / total * 100 if total else 0
+                self._prog_var.set(pct)
+                self._pct_label.configure(text=f"{pct:.1f}%")
+                self._chunk_label.configure(text=f"청크: {done}/{total}")
+                self._project_status.configure(
+                    text=f"{done}/{total} 청크 완료 ({pct:.0f}%)")
+                self._append_log(
+                    f"[프로젝트] {name}: {done}/{total} 청크 완료.", "warn")
+            except Exception:
+                self._project_status.configure(text="상태 파일 읽기 실패")
+        else:
+            self._prog_var.set(0)
+            self._pct_label.configure(text="0.0%")
+            self._chunk_label.configure(text="청크: -/-")
+            self._project_status.configure(text="미시작")
+
+    def _on_new_project(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("새 프로젝트 만들기")
+        dlg.configure(bg=THEME["bg"])
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        name_var  = tk.StringVar()
+        input_var = tk.StringVar()
+
+        ttk.Label(dlg, text="프로젝트 이름:").grid(
+            row=0, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(dlg, textvariable=name_var, width=36).grid(
+            row=0, column=1, padx=4, pady=4, sticky="ew")
+
+        ttk.Label(dlg, text="입력 파일:").grid(
+            row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(dlg, textvariable=input_var, width=36).grid(
+            row=1, column=1, padx=4, pady=4, sticky="ew")
+
+        def _browse():
+            p = filedialog.askopenfilename(
+                filetypes=[("TXR files", "*.txr"), ("Text files", "*.txt"),
+                           ("All files", "*.*")])
+            if p:
+                input_var.set(p)
+
+        ttk.Button(dlg, text="찾기", command=_browse).grid(row=1, column=2, padx=4)
+
+        def _confirm():
+            name  = name_var.get().strip()
+            ipath = input_var.get().strip()
+            if not name:
+                messagebox.showwarning("경고", "프로젝트 이름을 입력하세요.", parent=dlg)
+                return
+            if not ipath or not Path(ipath).exists():
+                messagebox.showwarning("경고", "유효한 입력 파일을 선택하세요.", parent=dlg)
+                return
+            try:
+                self._proj_mgr.create_project(name, ipath)
+            except ValueError as e:
+                messagebox.showerror("오류", str(e), parent=dlg)
+                return
+            dlg.destroy()
+            self._refresh_project_combo()
+            self._project_combo.set(name)
+            self._debug_var.set("")
+            self._final_var.set("")
+            self._on_project_selected()
+
+        btn_fr = tk.Frame(dlg, bg=THEME["bg"])
+        btn_fr.grid(row=2, column=0, columnspan=3, pady=8)
+        ttk.Button(btn_fr, text="만들기", command=_confirm).pack(side="left", padx=4)
+        ttk.Button(btn_fr, text="취소",   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.columnconfigure(1, weight=1)
+
+    def _on_delete_project(self):
+        if not self._current_project:
+            messagebox.showinfo("안내", "삭제할 프로젝트를 선택하세요.")
+            return
+        name = self._current_project["name"]
+        if not messagebox.askyesno("확인",
+                                   f"'{name}' 프로젝트를 삭제하시겠습니까?\n"
+                                   "상태 파일도 함께 삭제됩니다."):
+            return
+        self._proj_mgr.delete_project(name)
+        self._current_project = None
+        self._input_var.set("")
+        self._debug_var.set("")
+        self._final_var.set("")
+        self._prog_var.set(0)
+        self._pct_label.configure(text="0.0%")
+        self._chunk_label.configure(text="청크: -/-")
+        self._project_status.configure(text="")
+        self._refresh_project_combo()
+        self._append_log(f"[프로젝트 삭제] {name}", "warn")
+
+    # ── 설정 로드/저장 ───────────────────────────────────────────
+    def _load_config_and_projects(self):
+        cfg = self._config.load()
+        self._proj_mgr.load()
+
+        self._token_var.set(cfg.get("llm_token") or "")
+
+        model_key = cfg.get("model") or DEFAULT_MODEL
+        if model_key in self._model_keys:
+            self._model_combo.current(self._model_keys.index(model_key))
+
+        self._lpc_var.set(str(cfg.get("lines_per_batch") or LINES_PER_CHUNK))
+        self._chunks_run_var.set(str(cfg.get("max_consecutive_runs") or 0))
+
+        prompt = cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+        self._prompt_text.delete("1.0", "end")
+        self._prompt_text.insert("1.0", prompt)
+
+        for fr, _, _ in list(self._glossary_rows):
+            fr.destroy()
+        self._glossary_rows.clear()
+        for pair in (cfg.get("glossary") or []):
+            if len(pair) == 2:
+                self._add_glossary_row(pair[0], pair[1])
+
+        self._refresh_project_combo()
+        last_name = cfg.get("last_project_name") or ""
+        if last_name and last_name in self._proj_mgr.get_names():
+            self._project_combo.set(last_name)
+            self._on_project_selected()
+
+    def _save_config(self):
+        glossary = [[s.get().strip(), t.get().strip()]
+                    for _, s, t in self._glossary_rows
+                    if s.get().strip() and t.get().strip()]
+        model_key = self._model_keys[self._model_combo.current()]
+        self._config.save({
+            "llm_token":            self._token_var.get().strip(),
+            "model":                model_key,
+            "lines_per_batch":      self._lpc_var.get(),
+            "max_consecutive_runs": self._chunks_run_var.get(),
+            "system_prompt":        self._prompt_text.get("1.0", "end").strip(),
+            "glossary":             glossary,
+            "last_project_name":    self._current_project["name"]
+                                    if self._current_project else "",
+        })
+
+    def _on_close(self):
+        self._save_config()
+        self.destroy()
+
     # ── 설정 토글 ───────────────────────────────────────────────
     def _toggle_settings(self):
         if self._settings_visible:
@@ -400,6 +604,12 @@ class TranslationApp(tk.Tk):
                     for _, s, t in self._glossary_rows
                     if s.get().strip() and t.get().strip()]
 
+        state_path = None
+        if self._current_project:
+            state_path = self._current_project.get("state_file_path")
+
+        self._save_config()
+
         self._engine.configure(
             input_path=inp,
             output_debug=debug_p,
@@ -410,6 +620,7 @@ class TranslationApp(tk.Tk):
             lines_per_chunk=lpc,
             max_chunks_per_run=max_chunks,
             glossary=glossary,
+            state_path=state_path,
         )
 
         try:
@@ -576,11 +787,19 @@ class TranslationApp(tk.Tk):
         ))
 
     def _cb_complete(self, total_chunks, chunks_done_total, all_done):
+        if self._current_project:
+            try:
+                self._proj_mgr.touch_modified(self._current_project["name"])
+            except Exception:
+                pass
+
         def _ui():
             self._btn_start.configure(state="normal")
             self._btn_pause.configure(state="disabled")
             self._btn_resume.configure(state="disabled")
             self._btn_stop.configure(state="disabled")
+            if self._current_project:
+                self._on_project_selected()
             if all_done:
                 self._prog_var.set(100)
                 self._pct_label.configure(text="100%")

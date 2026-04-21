@@ -14,15 +14,19 @@ import re
 import os
 import time
 import threading
+import hashlib
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 
 # ── 상수 ───────────────────────────────────────────────────────────────────
 
+APP_DIR = Path(__file__).parent.resolve()
+
 GITHUB_COPILOT_ENDPOINT = "https://api.githubcopilot.com"
 DEFAULT_MODEL = "claude-sonnet-4.5"
-LINES_PER_CHUNK = 3000
+LINES_PER_CHUNK = 10
 CONTEXT_TAIL_CHARS = 500
 
 MODEL_CONFIGS = {
@@ -285,6 +289,132 @@ class TranslatorClient:
         return self.translate_batch(strings, context, system_prompt, on_token)
 
 
+# ── 앱 설정 영속성 ────────────────────────────────────────────────────────
+
+class AppConfig:
+    """앱 전역 설정을 trans_config.json에 저장/복원."""
+
+    CONFIG_PATH = APP_DIR / "trans_config.json"
+
+    DEFAULTS: dict = {
+        "llm_token":            "",
+        "model":                DEFAULT_MODEL,
+        "endpoint":             GITHUB_COPILOT_ENDPOINT,
+        "lines_per_batch":      10,
+        "max_consecutive_runs": 0,
+        "system_prompt":        DEFAULT_SYSTEM_PROMPT,
+        "glossary":             [],
+        "last_project_name":    "",
+    }
+
+    def __init__(self):
+        self._data: dict = dict(self.DEFAULTS)
+
+    def load(self) -> dict:
+        if self.CONFIG_PATH.exists():
+            try:
+                with open(self.CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                for key, default in self.DEFAULTS.items():
+                    self._data[key] = loaded.get(key, default)
+            except Exception:
+                self._data = dict(self.DEFAULTS)
+        return dict(self._data)
+
+    def save(self, data: dict):
+        self._data.update(data)
+        tmp = str(self.CONFIG_PATH) + ".tmp"
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.CONFIG_PATH)
+        except Exception:
+            pass
+
+    def get(self, key: str):
+        return self._data.get(key, self.DEFAULTS.get(key))
+
+
+# ── 프로젝트 관리 ──────────────────────────────────────────────────────────
+
+class ProjectManager:
+    """trans_projects.json으로 명명된 프로젝트를 관리."""
+
+    PROJECTS_PATH = APP_DIR / "trans_projects.json"
+    PROJECTS_DIR  = APP_DIR / "projects"
+
+    def __init__(self):
+        self._projects: list = []
+        self._ensure_dirs()
+
+    def _ensure_dirs(self):
+        self.PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    def load(self):
+        if self.PROJECTS_PATH.exists():
+            try:
+                with open(self.PROJECTS_PATH, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                self._projects = data.get("projects", [])
+            except Exception:
+                self._projects = []
+
+    def _save(self):
+        tmp = str(self.PROJECTS_PATH) + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({"version": 1, "projects": self._projects},
+                      f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.PROJECTS_PATH)
+
+    @staticmethod
+    def _make_state_filename(name: str, input_path: str) -> str:
+        sanitized = re.sub(r'[^\w가-힣]', '_', name)[:40]
+        h = hashlib.md5((name + input_path).encode()).hexdigest()[:8]
+        return f"{sanitized}_{h}.trans_state.json"
+
+    def get_names(self) -> list:
+        return [p["name"] for p in self._projects]
+
+    def get_project(self, name: str) -> dict | None:
+        for p in self._projects:
+            if p["name"] == name:
+                return p
+        return None
+
+    def create_project(self, name: str, input_path: str) -> dict:
+        if self.get_project(name):
+            raise ValueError(f"이미 존재하는 프로젝트 이름: {name}")
+        now = datetime.now().isoformat(timespec='seconds')
+        state_fname = self._make_state_filename(name, input_path)
+        state_path  = str(self.PROJECTS_DIR / state_fname)
+        proj = {
+            "name":            name,
+            "input_path":      str(input_path),
+            "state_file_path": state_path,
+            "created_at":      now,
+            "last_modified":   now,
+        }
+        self._projects.append(proj)
+        self._save()
+        return proj
+
+    def delete_project(self, name: str):
+        proj = self.get_project(name)
+        if not proj:
+            return
+        state = Path(proj["state_file_path"])
+        if state.exists():
+            state.unlink()
+        self._projects = [p for p in self._projects if p["name"] != name]
+        self._save()
+
+    def touch_modified(self, name: str):
+        proj = self.get_project(name)
+        if proj:
+            proj["last_modified"] = datetime.now().isoformat(timespec='seconds')
+            self._save()
+
+
 # ── 파일 청커 ──────────────────────────────────────────────────────────────
 
 class FileChunker:
@@ -343,9 +473,12 @@ class FileChunker:
 class StateManager:
     """JSON 상태 파일로 번역 진행 상태 저장/복원."""
 
-    def __init__(self, input_path: str):
-        p = Path(input_path)
-        self._state_path = p.parent / (p.stem + ".trans_state.json")
+    def __init__(self, input_path: str, state_path: str = None):
+        if state_path:
+            self._state_path = Path(state_path)
+        else:
+            p = Path(input_path)
+            self._state_path = p.parent / (p.stem + ".trans_state.json")
         self.state: dict = {}
 
     def exists(self) -> bool:
@@ -456,7 +589,8 @@ class TranslationEngine:
                   token: str, model: str, system_prompt: str,
                   lines_per_chunk: int = LINES_PER_CHUNK,
                   max_chunks_per_run: int = 0,
-                  glossary: list = None):
+                  glossary: list = None,
+                  state_path: str = None):
         self._input_path        = input_path
         self._output_debug      = output_debug
         self._output_final      = output_final
@@ -464,7 +598,7 @@ class TranslationEngine:
         self._max_chunks_per_run = max_chunks_per_run
         self._glossary          = glossary or []
         self._chunker   = FileChunker(input_path, lines_per_chunk)
-        self._state_mgr = StateManager(input_path)
+        self._state_mgr = StateManager(input_path, state_path)
         self._client    = TranslatorClient(token, model)
 
     # ── 상태 ──────────────────────────────────────────────────
