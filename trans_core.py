@@ -448,6 +448,83 @@ class ProjectManager:
             self._save()
 
 
+# ── 줄 단위 추출 번역기 (TXT 모드) ────────────────────────────────────────
+
+class LineExtractor:
+    """
+    TXT 파일에서 비어있지 않은 줄만 추출하여 번역 관리.
+    번역 결과는 메모리에 보관 → save_output() 호출 시 파일에 적용.
+    """
+
+    def __init__(self, input_path: str, state_path: str = None):
+        self.input_path = str(input_path)
+        if state_path:
+            self._state_path = Path(state_path).with_suffix('.line.json')
+        else:
+            p = Path(input_path)
+            self._state_path = p.parent / (p.stem + "_line.json")
+        self.all_lines: list = []       # 파일 전체 줄 (원본 그대로)
+        self.extracted: list = []       # [(orig_line_idx, content), ...]
+        self.translations: dict = {}    # orig_line_idx → translated_text
+
+    def load(self):
+        """파일 로드 + 비어있지 않은 줄 추출."""
+        text = ""
+        for enc in ('utf-8', 'utf-8-sig', 'cp1252', 'latin-1'):
+            try:
+                text = Path(self.input_path).read_text(encoding=enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        self.all_lines = text.splitlines()
+        self.extracted = [
+            (i, line.strip())
+            for i, line in enumerate(self.all_lines)
+            if line.strip()
+        ]
+
+    @property
+    def total_extracted(self) -> int:
+        return len(self.extracted)
+
+    @property
+    def translated_count(self) -> int:
+        return len(self.translations)
+
+    def get_batch(self, start: int, size: int) -> list:
+        """extracted 배열에서 start부터 size개 반환."""
+        return self.extracted[start:start + size]
+
+    def set_translation(self, orig_idx: int, text: str):
+        self.translations[orig_idx] = text
+
+    def exists_state(self) -> bool:
+        return self._state_path.exists()
+
+    def load_state(self):
+        with open(self._state_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        self.translations = {int(k): v for k, v in data.get("translations", {}).items()}
+
+    def save_state(self):
+        tmp = str(self._state_path) + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({
+                "version": 1,
+                "input_path": self.input_path,
+                "extracted_count": len(self.extracted),
+                "translations": {str(k): v for k, v in self.translations.items()},
+            }, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self._state_path)
+
+    def save_output(self, output_path: str):
+        """번역 적용 결과 파일 저장 (원본 구조 유지)."""
+        result = list(self.all_lines)
+        for line_idx, translation in self.translations.items():
+            result[line_idx] = translation
+        Path(output_path).write_text('\n'.join(result), encoding='utf-8')
+
+
 # ── 파일 청커 ──────────────────────────────────────────────────────────────
 
 class FileChunker:

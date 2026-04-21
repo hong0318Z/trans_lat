@@ -10,7 +10,7 @@ import time
 from trans_core import (
     TranslationEngine, StateManager, MODEL_CONFIGS, DEFAULT_MODEL,
     DEFAULT_SYSTEM_PROMPT, LINES_PER_CHUNK, TranslatorClient,
-    AppConfig, ProjectManager,
+    AppConfig, ProjectManager, LineExtractor,
 )
 
 # ── 다크 테마 ──────────────────────────────────────────────────────────────
@@ -48,6 +48,11 @@ class TranslationApp(tk.Tk):
         self._config = AppConfig()
         self._proj_mgr = ProjectManager()
         self._current_project: dict | None = None
+        # 줄 번역 모드 (TXT)
+        self._extractor: LineExtractor | None = None
+        self._line_mode = False
+        self._line_stop = threading.Event()
+        self._line_pause = threading.Event()
         self._build_style()
         self._build_ui()
         self._load_config_and_projects()
@@ -212,9 +217,13 @@ class TranslationApp(tk.Tk):
         self._btn_retrans = tk.Button(parent, text="🔄 선택 재번역", bg=THEME["warn"],
                                       fg="#1e1e2e", relief="flat", bd=0,
                                       command=self._on_retranslate_selection, padx=8)
+        self._btn_save = tk.Button(parent, text="💾 저장", bg=THEME["accent"],
+                                   fg="#1e1e2e", relief="flat", bd=0,
+                                   command=self._on_save_output, padx=8,
+                                   state="disabled")
 
         for b in (self._btn_start, self._btn_pause, self._btn_resume,
-                  self._btn_stop, self._btn_retrans):
+                  self._btn_stop, self._btn_retrans, self._btn_save):
             b.pack(side="left", padx=3, pady=3)
 
         # 진행률
@@ -554,8 +563,11 @@ class TranslationApp(tk.Tk):
             var.set(p)
 
     def _preview_file(self, path: str):
-        """파일 내용을 원본 패널에 미리 표시 (최대 1000줄)."""
+        """파일 로드 미리보기. txt → 추출 대상 줄만, txr → 원본 전체."""
         try:
+            ext = Path(path).suffix.lower()
+            is_txt = ext not in ('.txr', '.qsp')
+
             text = ""
             for enc in ('utf-8', 'utf-8-sig', 'cp1252', 'latin-1'):
                 try:
@@ -563,23 +575,46 @@ class TranslationApp(tk.Tk):
                     break
                 except UnicodeDecodeError:
                     continue
+
             lines = text.splitlines()
-            total = len(lines)
-            preview = '\n'.join(lines[:1000])
-            if total > 1000:
-                preview += f"\n... (총 {total}줄 중 1000줄만 표시)"
+            total_lines = len(lines)
+
+            if is_txt:
+                # TXT 모드: 비어있지 않은 줄만 추출해서 표시
+                extracted = [(i, l.strip()) for i, l in enumerate(lines) if l.strip()]
+                ext_total = len(extracted)
+                preview_items = extracted[:500]
+                preview = '\n'.join(f"줄{i+1}: {c}" for i, c in preview_items)
+                if ext_total > 500:
+                    preview += f"\n... (총 {ext_total}개 중 500개 표시)"
+                try:
+                    lpc = int(self._lpc_var.get())
+                except Exception:
+                    lpc = LINES_PER_CHUNK
+                batches = (ext_total + lpc - 1) // lpc if lpc > 0 else 1
+                self._chunk_label.configure(text=f"추출: {ext_total}줄 / 예상 배치: {batches}")
+                self._append_log(
+                    f"[파일 로드] {Path(path).name}: 전체 {total_lines}줄 → "
+                    f"번역 대상 {ext_total}줄 추출, 배치 {batches}개 예상", "info")
+            else:
+                # QSP/TXR 모드: 전체 내용 표시
+                preview = '\n'.join(lines[:1000])
+                if total_lines > 1000:
+                    preview += f"\n... (총 {total_lines}줄 중 1000줄만 표시)"
+                try:
+                    lpc = int(self._lpc_var.get())
+                except Exception:
+                    lpc = LINES_PER_CHUNK
+                chunks = (total_lines + lpc - 1) // lpc if lpc > 0 else 1
+                self._chunk_label.configure(text=f"예상 배치: 0/{chunks}")
+                self._append_log(
+                    f"[파일 로드] {Path(path).name}: 총 {total_lines}줄 → 배치 {chunks}개 예상", "info")
+
             self._orig_text.configure(state="normal")
             self._orig_text.delete("1.0", "end")
             self._orig_text.insert("1.0", preview)
             self._orig_text.configure(state="disabled")
-            try:
-                lpc = int(self._lpc_var.get())
-            except Exception:
-                lpc = LINES_PER_CHUNK
-            chunks = (total + lpc - 1) // lpc if lpc > 0 else 1
-            self._chunk_label.configure(text=f"예상 배치: 0/{chunks}")
-            self._append_log(
-                f"[파일 로드] {Path(path).name}: 총 {total}줄 → 배치 {chunks}개 예상", "info")
+            self._trans_text.delete("1.0", "end")
         except Exception as ex:
             self._append_log(f"[미리보기 실패] {ex}", "err")
 
@@ -621,41 +656,85 @@ class TranslationApp(tk.Tk):
             return
 
         model   = self._model_keys[self._model_combo.current()]
-        debug_p = self._debug_var.get().strip()
         final_p = self._final_var.get().strip()
         try:
-            max_chunks = int(self._chunks_run_var.get())
+            max_runs = int(self._chunks_run_var.get())
         except ValueError:
-            max_chunks = 0
+            max_runs = 0
         try:
             lpc = int(self._lpc_var.get())
         except ValueError:
             lpc = LINES_PER_CHUNK
 
+        self._save_config()
+
+        is_txt = Path(inp).suffix.lower() not in ('.txr', '.qsp')
+        if is_txt:
+            self._start_line_translation(inp, token, model, lpc, max_runs, final_p)
+        else:
+            self._start_qsp_translation(inp, token, model, lpc, max_runs, final_p)
+
+    def _start_line_translation(self, inp, token, model, lpc, max_runs, final_p):
+        """TXT 줄 번역 모드 시작."""
+        state_path = self._current_project.get("state_file_path") if self._current_project else None
+        ext = LineExtractor(inp, state_path)
+        try:
+            ext.load()
+        except Exception as ex:
+            messagebox.showerror("오류", f"파일 로드 실패:\n{ex}")
+            return
+
+        if ext.exists_state():
+            try:
+                ext.load_state()
+                self._append_log(
+                    f"[재개] 이전 번역 복원: {ext.translated_count}/{ext.total_extracted}줄", "warn")
+            except Exception:
+                pass
+
+        self._extractor = ext
+        self._line_mode = True
+        self._line_stop.clear()
+        self._line_pause.clear()
+
+        # 왼쪽 패널: 추출된 줄 전체 표시
+        self._show_extracted_lines()
+        # 오른쪽 패널: 번역 현황 (이전 번역 있으면 표시)
+        self._refresh_right_panel()
+
+        system_prompt = self._build_glossary_prompt()
+        client = TranslatorClient(token, model)
+
+        self._btn_start.configure(state="disabled")
+        self._btn_pause.configure(state="normal")
+        self._btn_stop.configure(state="normal")
+        self._btn_save.configure(state="disabled")
+
+        threading.Thread(
+            target=self._line_translation_loop,
+            args=(client, system_prompt, lpc, max_runs),
+            daemon=True,
+        ).start()
+        self._append_log(
+            f"[번역 시작] {Path(inp).name} | 모델: {model} | "
+            f"추출 {ext.total_extracted}줄 / 배치 {lpc}줄", "info")
+
+    def _start_qsp_translation(self, inp, token, model, lpc, max_runs, final_p):
+        """TXR/QSP 청크 번역 모드 시작."""
+        self._line_mode = False
+        debug_p = self._debug_var.get().strip()
         system_prompt = self._build_glossary_prompt()
         glossary = [(s.get().strip(), t.get().strip())
                     for _, s, t in self._glossary_rows
                     if s.get().strip() and t.get().strip()]
-
-        state_path = None
-        if self._current_project:
-            state_path = self._current_project.get("state_file_path")
-
-        self._save_config()
+        state_path = self._current_project.get("state_file_path") if self._current_project else None
 
         self._engine.configure(
-            input_path=inp,
-            output_debug=debug_p,
-            output_final=final_p,
-            token=token,
-            model=model,
-            system_prompt=system_prompt,
-            lines_per_chunk=lpc,
-            max_chunks_per_run=max_chunks,
-            glossary=glossary,
-            state_path=state_path,
+            input_path=inp, output_debug=debug_p, output_final=final_p,
+            token=token, model=model, system_prompt=system_prompt,
+            lines_per_chunk=lpc, max_chunks_per_run=max_runs,
+            glossary=glossary, state_path=state_path,
         )
-
         try:
             state = self._engine.load_or_create_state()
             total = state["total_chunks"]
@@ -679,20 +758,156 @@ class TranslationApp(tk.Tk):
         )
         self._append_log(f"번역 시작: {Path(inp).name} | 모델: {model}", "info")
 
+    # ── 줄 번역 루프 (백그라운드) ─────────────────────────────────
+    def _line_translation_loop(self, client, system_prompt, lpc, max_runs):
+        ext = self._extractor
+        # 이미 번역된 줄 수부터 시작
+        start = ext.translated_count
+        runs = 0
+        last_context = ""
+
+        while start < ext.total_extracted:
+            if self._line_stop.is_set():
+                break
+            while self._line_pause.is_set():
+                if self._line_stop.is_set():
+                    break
+                time.sleep(0.2)
+            if self._line_stop.is_set():
+                break
+
+            batch = ext.get_batch(start, lpc)
+            contents = [content for _, content in batch]
+
+            try:
+                translated, tok_in, tok_out = client.translate_batch(
+                    contents, last_context, system_prompt)
+            except Exception as ex:
+                self.after(0, lambda e=ex: self._append_log(f"[오류] {e}", "err"))
+                break
+
+            for i, (orig_idx, _) in enumerate(batch):
+                if i < len(translated) and translated[i]:
+                    ext.set_translation(orig_idx, translated[i])
+
+            try:
+                ext.save_state()
+            except Exception:
+                pass
+
+            last_context = translated[-1] if translated else ""
+            runs += 1
+            start += len(batch)
+            done = ext.translated_count
+            total = ext.total_extracted
+            pct = done / total * 100 if total else 0
+
+            self.after(0, lambda d=done, t=total, p=pct, r=runs, mr=max_runs,
+                              ti=tok_in, to=tok_out: self._on_line_batch_done(d, t, p, r, mr, ti, to))
+
+            if max_runs > 0 and runs >= max_runs:
+                break
+
+        all_done = ext.translated_count >= ext.total_extracted
+        self.after(0, lambda ad=all_done: self._on_line_translation_complete(ad))
+
+    def _on_line_batch_done(self, done, total, pct, runs, max_runs, tok_in, tok_out):
+        self._prog_var.set(pct)
+        self._pct_label.configure(text=f"{pct:.1f}%")
+        run_info = f"/{max_runs}" if max_runs else ""
+        self._chunk_label.configure(text=f"번역: {done}/{total}줄  (배치 {runs}{run_info})")
+        self._append_log(
+            f"[배치 {runs}] {done}/{total}줄 완료 | 토큰 {tok_in}/{tok_out}", "ok")
+        self._refresh_right_panel()
+        if self._extractor and self._extractor.translated_count > 0:
+            self._btn_save.configure(state="normal")
+
+    def _on_line_translation_complete(self, all_done):
+        self._btn_start.configure(state="normal")
+        self._btn_pause.configure(state="disabled")
+        self._btn_resume.configure(state="disabled")
+        self._btn_stop.configure(state="disabled")
+        if self._extractor and self._extractor.translated_count > 0:
+            self._btn_save.configure(state="normal")
+        if all_done:
+            self._prog_var.set(100)
+            self._pct_label.configure(text="100%")
+            self._append_log(
+                f"[완료] 전체 {self._extractor.total_extracted}줄 번역 완료! "
+                "'💾 저장' 버튼으로 파일에 적용하세요.", "ok")
+        else:
+            self._append_log("번역 중지됨. '▶ 시작'으로 이어서 번역 가능.", "warn")
+
+    def _show_extracted_lines(self):
+        """추출된 줄 전체를 왼쪽 패널에 표시."""
+        if not self._extractor:
+            return
+        lines = [f"줄{i+1}: {c}" for i, c in self._extractor.extracted]
+        text = '\n'.join(lines)
+        self._orig_text.configure(state="normal")
+        self._orig_text.delete("1.0", "end")
+        self._orig_text.insert("1.0", text)
+        self._orig_text.configure(state="disabled")
+
+    def _refresh_right_panel(self):
+        """번역 현황을 오른쪽 패널에 표시 (번역된 것만)."""
+        if not self._extractor:
+            return
+        tr = self._extractor.translations
+        lines = []
+        for orig_idx, content in self._extractor.extracted:
+            if orig_idx in tr:
+                lines.append(f"줄{orig_idx+1}: {tr[orig_idx]}")
+            else:
+                lines.append(f"줄{orig_idx+1}: ...")
+        self._trans_text.delete("1.0", "end")
+        self._trans_text.insert("1.0", '\n'.join(lines))
+
+    def _on_save_output(self):
+        """번역 결과를 파일로 저장."""
+        if not self._extractor or not self._extractor.translations:
+            messagebox.showinfo("안내", "저장할 번역이 없습니다.")
+            return
+        out = self._final_var.get().strip()
+        if not out:
+            out = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+            if not out:
+                return
+            self._final_var.set(out)
+        try:
+            self._extractor.save_output(out)
+            done = self._extractor.translated_count
+            total = self._extractor.total_extracted
+            self._append_log(f"[저장 완료] {Path(out).name} ({done}/{total}줄 번역 적용)", "ok")
+        except Exception as ex:
+            messagebox.showerror("저장 오류", str(ex))
+
     def _on_pause(self):
-        self._engine.pause()
+        if self._line_mode:
+            self._line_pause.set()
+        else:
+            self._engine.pause()
         self._btn_pause.configure(state="disabled")
         self._btn_resume.configure(state="normal")
         self._append_log("일시정지됨.", "warn")
 
     def _on_resume(self):
-        self._engine.resume()
+        if self._line_mode:
+            self._line_pause.clear()
+        else:
+            self._engine.resume()
         self._btn_resume.configure(state="disabled")
         self._btn_pause.configure(state="normal")
         self._append_log("재개됨.", "info")
 
     def _on_stop(self):
-        self._engine.stop()
+        if self._line_mode:
+            self._line_stop.set()
+            self._line_pause.clear()
+        else:
+            self._engine.stop()
         self._btn_stop.configure(state="disabled")
         self._btn_pause.configure(state="disabled")
         self._btn_resume.configure(state="disabled")
