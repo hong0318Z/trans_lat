@@ -369,6 +369,7 @@ class TranslationApp(tk.Tk):
             self._pct_label.configure(text="0.0%")
             self._chunk_label.configure(text="청크: -/-")
             self._project_status.configure(text="미시작")
+        self._preview_file(proj["input_path"])
 
     def _on_new_project(self):
         dlg = tk.Toplevel(self)
@@ -516,7 +517,8 @@ class TranslationApp(tk.Tk):
     # ── 파일 찾기 ───────────────────────────────────────────────
     def _browse_input(self):
         p = filedialog.askopenfilename(
-            filetypes=[("TXR files", "*.txr"), ("All files", "*.*")])
+            filetypes=[("TXR files", "*.txr"), ("Text files", "*.txt"),
+                       ("All files", "*.*")])
         if not p:
             return
         self._input_var.set(p)
@@ -542,6 +544,7 @@ class TranslationApp(tk.Tk):
                 self._chunk_label.configure(text=f"청크: {done}/{total}")
             except Exception:
                 pass
+        self._preview_file(p)
 
     def _browse_out(self, var, suffix):
         p = filedialog.asksaveasfilename(
@@ -549,6 +552,36 @@ class TranslationApp(tk.Tk):
             filetypes=[("TXR files", "*.txr"), ("All files", "*.*")])
         if p:
             var.set(p)
+
+    def _preview_file(self, path: str):
+        """파일 내용을 원본 패널에 미리 표시 (최대 1000줄)."""
+        try:
+            text = ""
+            for enc in ('utf-8', 'utf-8-sig', 'cp1252', 'latin-1'):
+                try:
+                    text = Path(path).read_text(encoding=enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            lines = text.splitlines()
+            total = len(lines)
+            preview = '\n'.join(lines[:1000])
+            if total > 1000:
+                preview += f"\n... (총 {total}줄 중 1000줄만 표시)"
+            self._orig_text.configure(state="normal")
+            self._orig_text.delete("1.0", "end")
+            self._orig_text.insert("1.0", preview)
+            self._orig_text.configure(state="disabled")
+            try:
+                lpc = int(self._lpc_var.get())
+            except Exception:
+                lpc = LINES_PER_CHUNK
+            chunks = (total + lpc - 1) // lpc if lpc > 0 else 1
+            self._chunk_label.configure(text=f"예상 배치: 0/{chunks}")
+            self._append_log(
+                f"[파일 로드] {Path(path).name}: 총 {total}줄 → 배치 {chunks}개 예상", "info")
+        except Exception as ex:
+            self._append_log(f"[미리보기 실패] {ex}", "err")
 
     # ── 연결 테스트 ─────────────────────────────────────────────
     def _on_test_connection(self):
@@ -688,8 +721,10 @@ class TranslationApp(tk.Tk):
 
         # 해당 범위 원본 문자열 추출
         chunk_lines = self._current_orig_lines[start_line:end_line]
-        from trans_core import extract_strings
-        extractions = extract_strings(chunk_lines)
+        from trans_core import extract_strings, extract_lines_for_translation
+        inp = self._input_var.get().strip()
+        plain = Path(inp).suffix.lower() not in ('.txr', '.qsp') if inp else True
+        extractions = extract_lines_for_translation(chunk_lines) if plain else extract_strings(chunk_lines)
         orig_strings = [e[4] for e in extractions]
         if not orig_strings:
             messagebox.showinfo("안내", "선택 범위에서 번역 대상 문자열을 찾지 못했습니다.")
@@ -729,20 +764,17 @@ class TranslationApp(tk.Tk):
             self._syncing_scroll = False
 
     # ── 엔진 콜백 ────────────────────────────────────────────────
-    def _cb_chunk_start(self, chunk_idx, total_chunks, orig_lines, extractions):
+    def _cb_chunk_start(self, chunk_idx, total_chunks, line_start, line_end, orig_text, extraction_count):
         self._current_chunk_idx  = chunk_idx
-        self._current_orig_lines = orig_lines
-        self._current_extractions = extractions
+        self._current_orig_lines = orig_text.splitlines()
 
         def _ui():
-            # 원본 패널 업데이트
             self._orig_text.configure(state="normal")
             self._orig_text.delete("1.0", "end")
-            self._orig_text.insert("1.0", "".join(orig_lines))
+            self._orig_text.insert("1.0", orig_text)
             self._orig_text.configure(state="disabled")
-            # 번역 패널 초기화 (원본 내용으로 시작)
             self._trans_text.delete("1.0", "end")
-            self._trans_text.insert("1.0", "".join(orig_lines))
+            self._trans_text.insert("1.0", orig_text)
             self._chunk_label.configure(
                 text=f"청크: {chunk_idx + 1}/{total_chunks}")
 
@@ -764,7 +796,7 @@ class TranslationApp(tk.Tk):
         def _ui():
             # 번역 패널을 완성된 결과로 교체
             self._trans_text.delete("1.0", "end")
-            self._trans_text.insert("1.0", "".join(final_lines))
+            self._trans_text.insert("1.0", '\n'.join(final_lines))
             self._prog_var.set(pct)
             self._pct_label.configure(text=f"{pct:.1f}%")
             self._chunk_label.configure(
