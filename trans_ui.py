@@ -580,8 +580,9 @@ class TranslationApp(tk.Tk):
             total_lines = len(lines)
 
             if is_txt:
-                # TXT 모드: 비어있지 않은 줄만 추출해서 표시
-                extracted = [(i, l.strip()) for i, l in enumerate(lines) if l.strip()]
+                # TXT 모드: HTML 태그 제거 후 비어있지 않은 줄만 추출해서 표시
+                from trans_core import _strip_html
+                extracted = [(i, _strip_html(l)) for i, l in enumerate(lines) if _strip_html(l)]
                 ext_total = len(extracted)
                 preview_items = extracted[:500]
                 preview = '\n'.join(f"줄{i+1}: {c}" for i, c in preview_items)

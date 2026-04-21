@@ -450,9 +450,30 @@ class ProjectManager:
 
 # ── 줄 단위 추출 번역기 (TXT 모드) ────────────────────────────────────────
 
+_HTML_TAG_RE   = re.compile(r'<[^>]+>')
+_HTML_OPEN_RE  = re.compile(r'^(<[^>]+>)+')   # 줄 앞쪽 연속 태그
+_HTML_CLOSE_RE = re.compile(r'(</[^>]+>)+$')  # 줄 뒤쪽 연속 닫힘 태그
+
+
+def _strip_html(text: str) -> str:
+    return _HTML_TAG_RE.sub('', text).strip()
+
+
+def _apply_with_tags(orig: str, translation: str) -> str:
+    """원본 줄의 HTML 태그 구조를 보존하면서 텍스트만 번역으로 교체."""
+    m_pre = _HTML_OPEN_RE.match(orig)
+    prefix = m_pre.group(0) if m_pre else ''
+    m_suf = _HTML_CLOSE_RE.search(orig)
+    suffix = m_suf.group(0) if m_suf else ''
+    if prefix or suffix:
+        return f"{prefix}{translation}{suffix}"
+    return translation
+
+
 class LineExtractor:
     """
-    TXT 파일에서 비어있지 않은 줄만 추출하여 번역 관리.
+    TXT 파일에서 번역 대상 줄만 추출하여 번역 관리.
+    HTML 태그는 표시/LLM 전송 시 제거, 저장 시 원본 태그 구조에 번역 적용.
     번역 결과는 메모리에 보관 → save_output() 호출 시 파일에 적용.
     """
 
@@ -464,11 +485,11 @@ class LineExtractor:
             p = Path(input_path)
             self._state_path = p.parent / (p.stem + "_line.json")
         self.all_lines: list = []       # 파일 전체 줄 (원본 그대로)
-        self.extracted: list = []       # [(orig_line_idx, content), ...]
+        self.extracted: list = []       # [(orig_line_idx, clean_text), ...]
         self.translations: dict = {}    # orig_line_idx → translated_text
 
     def load(self):
-        """파일 로드 + 비어있지 않은 줄 추출."""
+        """파일 로드 + HTML 태그 제거 후 비어있지 않은 줄 추출."""
         text = ""
         for enc in ('utf-8', 'utf-8-sig', 'cp1252', 'latin-1'):
             try:
@@ -477,11 +498,12 @@ class LineExtractor:
             except UnicodeDecodeError:
                 continue
         self.all_lines = text.splitlines()
-        self.extracted = [
-            (i, line.strip())
-            for i, line in enumerate(self.all_lines)
-            if line.strip()
-        ]
+        result = []
+        for i, line in enumerate(self.all_lines):
+            clean = _strip_html(line)
+            if clean:
+                result.append((i, clean))
+        self.extracted = result
 
     @property
     def total_extracted(self) -> int:
@@ -518,10 +540,11 @@ class LineExtractor:
         os.replace(tmp, self._state_path)
 
     def save_output(self, output_path: str):
-        """번역 적용 결과 파일 저장 (원본 구조 유지)."""
+        """번역 적용 결과 파일 저장 (원본 HTML 태그 구조 보존)."""
         result = list(self.all_lines)
         for line_idx, translation in self.translations.items():
-            result[line_idx] = translation
+            orig = self.all_lines[line_idx]
+            result[line_idx] = _apply_with_tags(orig, translation)
         Path(output_path).write_text('\n'.join(result), encoding='utf-8')
 
 
